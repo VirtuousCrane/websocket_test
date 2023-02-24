@@ -1,9 +1,9 @@
-use std::{io::Error, sync::{Arc, Mutex}, collections::HashMap, net::SocketAddr};
+use std::{str, io::Error, sync::{Arc, Mutex}, collections::HashMap, net::SocketAddr};
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, StreamExt, TryStreamExt, SinkExt};
+use futures_util::{future, StreamExt, TryStreamExt, SinkExt, pin_mut};
 use log::info;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_tungstenite::tungstenite::Message;
 
 type Tx = UnboundedSender<Message>;
@@ -19,6 +19,7 @@ async fn main() -> Result<(), Error> {
     let listener = try_socket.expect("Failed to bind");
     info!("Listening on: localhost:8888");
     
+    tokio::spawn(listen_udp(state.clone()));
     while let Ok((stream, addr)) = listener.accept().await {
         tokio::spawn(handle_connection(state.clone(), stream, addr));
     }
@@ -29,14 +30,48 @@ async fn main() -> Result<(), Error> {
 async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
     println!("Incoming TCP connection from: {}", addr);
     
+    // Create a WebSocket Stream
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
         .expect("Error during the websocket handshake occurred");
     info!("New WebSocket connection: {}", addr);
     
+    // Splitting the WebSocket stream into outgoing and incoming streams
     let (mut outgoing, incoming) = ws_stream.split();
-    for _ in 1..100 {
-        outgoing.send(Message::Text("Hello, World!".into()))
-            .await;
+    
+    // Creating a Message Channel to send messages to the connected WebSockets
+    let (tx, rx) = unbounded();
+    peer_map.lock().unwrap().insert(addr, tx);
+    
+    let receiving = rx.map(Ok).forward(outgoing);
+    pin_mut!(receiving);
+    receiving.await;
+    
+    println!("{} Disconnected", &addr);
+    peer_map.lock().unwrap().remove(&addr);
+}
+
+async fn listen_udp(peer_map: PeerMap) {
+    let socket = UdpSocket::bind("127.0.0.1:8889")
+        .await
+        .expect("Failed to bind socket");
+    info!("Listening on {}", socket.local_addr().unwrap());
+    
+    loop {
+        let mut buf = [0; 512];
+        socket.recv(&mut buf)
+            .await
+            .expect("Failed to receive message");
+        
+        let peers = peer_map.lock().unwrap();
+        
+        for (_, peer) in peers.iter() { 
+            let msg = match str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(e) => panic!("{}", e)
+            };
+            
+            peer.unbounded_send(Message::Text(msg.into())).unwrap();
+        }
     }
 }
